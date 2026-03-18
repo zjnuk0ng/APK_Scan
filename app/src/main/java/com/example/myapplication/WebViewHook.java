@@ -1,6 +1,7 @@
 package com.example.myapplication;
 
 import android.util.Log;
+import android.webkit.WebSettings;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 
@@ -12,138 +13,112 @@ public class WebViewHook {
 
     private static final String TAG = "SEC_SCAN";
 
-    // 定义不同级别的 Log 标识
-    private static final String INFO = "[INFO] ";       // 普通配置信息
-    private static final String WARN = "[WARNING] ";    // 存在潜在风险的配置
-    private static final String CRITICAL = "[CRITICAL] "; // 极高危漏洞风险
-    private static final String VULN_XSS = "[VULN_XSS] ";
-    private static final String VULN_FILE = "[VULN_FILE] ";
-    private static final String VULN_URL = "[VULN_URL] ";
+    // 漏洞类型
+    private static final String VULN_XSS = "VULN_XSS";
+    private static final String VULN_FILE = "VULN_FILE";
+    private static final String VULN_URL = "VULN_URL";
+    private static final String VULN_CONFIG = "VULN_CONFIG";
 
     public static void init(XC_LoadPackage.LoadPackageParam lpparam) {
-        hookWebSettings(lpparam);
+        // 不再 Hook WebSettings 抽象类，改为在行为触发时检查
         hookAddJSInterface(lpparam);
         hookLoadUrl(lpparam);
         hookWebViewClient(lpparam);
     }
 
-    // 1. 探测 WebSettings 安全配置
-    private static void hookWebSettings(XC_LoadPackage.LoadPackageParam lpparam) {
-        Class<?> webSettingsClass = XposedHelpers.findClass("android.webkit.WebSettings", lpparam.classLoader);
+    // 辅助方法：检查 WebView 的各项配置
+    private static void checkWebViewSettings(WebView webView, String packageName) {
+        try {
+            WebSettings settings = webView.getSettings();
+            if (settings == null) return;
 
-        // 检测 JavaScript 开关
-        XposedHelpers.findAndHookMethod(webSettingsClass, "setJavaScriptEnabled", boolean.class, new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                boolean enabled = (boolean) param.args[0];
-                if (enabled) {
-                    Log.w(TAG, VULN_XSS + "JavaScript is ENABLED. Potential XSS entry point.");
-                }
+            if (settings.getJavaScriptEnabled()) {
+                report(packageName, VULN_CONFIG, "Running with JavaScript ENABLED");
             }
-        });
+            if (settings.getAllowFileAccess()) {
+                report(packageName, VULN_CONFIG, "Running with AllowFileAccess ENABLED");
+            }
 
-        // 检测文件访问权限 (file://)
-        XposedHelpers.findAndHookMethod(webSettingsClass, "setAllowFileAccess", boolean.class, new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                boolean allowed = (boolean) param.args[0];
-                if (allowed) {
-                    Log.w(TAG, VULN_FILE + "setAllowFileAccess(true): App can read local files via file://");
-                }
-            }
-        });
+            // 检查跨域文件访问 (API 16+)
+            boolean allowFileAny = (boolean) XposedHelpers.callMethod(settings, "getAllowFileAccessFromFileURLs");
+            boolean allowUniversal = (boolean) XposedHelpers.callMethod(settings, "getAllowUniversalAccessFromFileURLs");
 
-        // 跨域文件访问：最重要的两个文件读取漏洞开关
-        XposedHelpers.findAndHookMethod(webSettingsClass, "setAllowFileAccessFromFileURLs", boolean.class, new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                if ((boolean) param.args[0]) {
-                    Log.e(TAG, CRITICAL + "setAllowFileAccessFromFileURLs(true): HIGH RISK! File-based XSS can steal local files.");
-                }
+            if (allowFileAny) {
+                report(packageName, VULN_FILE, "CRITICAL: AllowFileAccessFromFileURLs is TRUE");
             }
-        });
-
-        XposedHelpers.findAndHookMethod(webSettingsClass, "setAllowUniversalAccessFromFileURLs", boolean.class, new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                if ((boolean) param.args[0]) {
-                    Log.e(TAG, CRITICAL + "setAllowUniversalAccessFromFileURLs(true): EXTREME RISK! Any file can bypass SOP.");
-                }
+            if (allowUniversal) {
+                report(packageName, VULN_FILE, "CRITICAL: AllowUniversalAccessFromFileURLs is TRUE");
             }
-        });
+        } catch (Throwable t) {
+            // 防止某些厂商定制 WebView 导致崩溃
+        }
     }
 
-    // 2. JSBridge 导出接口探测
-    private static void hookAddJSInterface(XC_LoadPackage.LoadPackageParam lpparam) {
-        XposedHelpers.findAndHookMethod("android.webkit.WebView", lpparam.classLoader, "addJavascriptInterface",
+    // 1. JSBridge 导出接口探测
+    private static void hookAddJSInterface(final XC_LoadPackage.LoadPackageParam lpparam) {
+        XposedHelpers.findAndHookMethod(WebView.class, "addJavascriptInterface",
                 Object.class, String.class, new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         String name = (String) param.args[1];
                         Object obj = param.args[0];
-                        Log.i(TAG, VULN_XSS + "JSBridge Exported -> Name: " + name + " | Class: " + obj.getClass().getName());
-                        // 打印调用栈，确认是在哪里导出的
-                        // Log.d(TAG, Log.getStackTraceString(new Throwable()));
+                        String msg = "JSBridge Exported -> Name: " + name + " | Class: " + obj.getClass().getName();
+                        report(lpparam.packageName, VULN_XSS, msg);
+
+                        // 导出接口时顺便检查一下配置
+                        checkWebViewSettings((WebView) param.thisObject, lpparam.packageName);
                     }
                 });
     }
 
-    // 3. 拦截 URL 加载，探测敏感协议
-    private static void hookLoadUrl(XC_LoadPackage.LoadPackageParam lpparam) {
-        XposedHelpers.findAndHookMethod("android.webkit.WebView", lpparam.classLoader, "loadUrl", String.class, new XC_MethodHook() {
+    // 2. 拦截 URL 加载并探测配置
+    private static void hookLoadUrl(final XC_LoadPackage.LoadPackageParam lpparam) {
+        XposedHelpers.findAndHookMethod(WebView.class, "loadUrl", String.class, new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 String url = (String) param.args[0];
                 if (url == null) return;
 
-                Log.i(TAG, VULN_URL + "Loading URL: " + url);
+                // 核心：加载网页前进行全量基线检查
+                checkWebViewSettings((WebView) param.thisObject, lpparam.packageName);
 
-                if (url.startsWith("file:///android_asset/") || url.startsWith("file:///sdcard/")) {
-                    Log.w(TAG, VULN_FILE + "Loading local file: " + url);
+                if (url.startsWith("file://")) {
+                    report(lpparam.packageName, VULN_FILE, "Loading local file: " + url);
                 } else if (url.startsWith("javascript:")) {
-                    Log.w(TAG, VULN_XSS + "Executing Inline JS: " + url);
+                    report(lpparam.packageName, VULN_XSS, "Executing Inline JS: " + url);
                 } else if (url.startsWith("http://")) {
-                    Log.w(TAG, WARN + "Insecure Cleartext HTTP: " + url);
+                    report(lpparam.packageName, VULN_URL, "Insecure HTTP: " + url);
                 }
             }
         });
     }
 
-    // 4. 探测外部页面打开逻辑 (shouldOverrideUrlLoading)
-    private static void hookWebViewClient(XC_LoadPackage.LoadPackageParam lpparam) {
-        // 由于 shouldOverrideUrlLoading 是在子类中实现的，我们 Hook WebView 的 setWebViewClient 方法
-        // 然后动态 Hook 传入的对象
-        XposedHelpers.findAndHookMethod("android.webkit.WebView", lpparam.classLoader, "setWebViewClient",
+    // 3. 探测外部页面打开逻辑
+    private static void hookWebViewClient(final XC_LoadPackage.LoadPackageParam lpparam) {
+        XposedHelpers.findAndHookMethod(WebView.class, "setWebViewClient",
                 "android.webkit.WebViewClient", new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         Object client = param.args[0];
                         if (client == null) return;
 
-                        Log.i(TAG, INFO + "WebViewClient set: " + client.getClass().getName());
-
-                        // Hook 该 Client 的 URL 过滤逻辑
+                        final String clientName = client.getClass().getName();
                         try {
                             XposedHelpers.findAndHookMethod(client.getClass(), "shouldOverrideUrlLoading",
                                     WebView.class, String.class, new XC_MethodHook() {
                                         @Override
                                         protected void afterHookedMethod(MethodHookParam param) {
-                                            Log.d(TAG, VULN_URL + "shouldOverrideUrlLoading(String) returned: " + param.getResult() + " for URL: " + param.args[1]);
-                                        }
-                                    });
-                        } catch (Throwable ignored) {}
-
-                        try {
-                            XposedHelpers.findAndHookMethod(client.getClass(), "shouldOverrideUrlLoading",
-                                    WebView.class, WebResourceRequest.class, new XC_MethodHook() {
-                                        @Override
-                                        protected void afterHookedMethod(MethodHookParam param) {
-                                            WebResourceRequest request = (WebResourceRequest) param.args[1];
-                                            Log.d(TAG, VULN_URL + "shouldOverrideUrlLoading(Request) returned: " + param.getResult() + " for URL: " + request.getUrl());
+                                            String url = (String) param.args[1];
+                                            report(lpparam.packageName, VULN_URL, "shouldOverrideUrlLoading in " + clientName + " -> URL: " + url);
                                         }
                                     });
                         } catch (Throwable ignored) {}
                     }
                 });
+    }
+
+    private static void report(String pkg, String type, String msg) {
+        Log.i(TAG, "[" + type + "] " + msg);
+        SecurityUtils.reportEvent(pkg, type, msg);
     }
 }
