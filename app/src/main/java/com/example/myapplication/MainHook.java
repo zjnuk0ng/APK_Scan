@@ -31,6 +31,9 @@ public class MainHook implements IXposedHookLoadPackage {
 
         // 采集目标 App 基线信息
         hookApplicationForBaseline(lpparam);
+
+        // IPC 监控
+        IPCHook.init(lpparam);
     }
 
     private void hookApplicationForBaseline(XC_LoadPackage.LoadPackageParam lpparam) {
