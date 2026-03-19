@@ -1,13 +1,16 @@
 package com.example.myapplication;
 
+import android.app.Application;
+import android.content.Context;
 import android.util.Log;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 import dalvik.system.DexClassLoader;
 import dalvik.system.PathClassLoader;
-import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
@@ -16,14 +19,13 @@ public class SDKHook {
 
     private static final String TAG = "SEC_SCAN";
 
-    // 类型定义
     private static final String SDK_CLASS = "SDK_CLASS";
     private static final String SDK_DEX = "SDK_DYNAMIC_LOAD";
-    private static final String SDK_SO = "SDK_NATIVE_LOAD";
     private static final String SDK_NETWORK = "SDK_NETWORK";
 
-    // SDK 指纹
     private static final Map<String, String> SDK_RULES = new HashMap<>();
+    private static final Set<String> SEEN_CLASSES = new HashSet<>();
+    private static final ThreadLocal<Boolean> GUARD = new ThreadLocal<>();
 
     static {
         SDK_RULES.put("com.facebook.", "Facebook SDK");
@@ -35,93 +37,104 @@ public class SDKHook {
     }
 
     public static void init(final XC_LoadPackage.LoadPackageParam lpparam) {
-        hookClassLoader(lpparam);
-        hookDexLoader(lpparam);
-        hookSoLoad(lpparam);
-        hookNetwork(lpparam);
+
+        // 只 hook 目标 App
+        if (!lpparam.packageName.equals("com.app99.driver")) return;
+
+        // 延迟到 Application.attach
+        XposedHelpers.findAndHookMethod(
+                Application.class,
+                "attach",
+                Context.class,
+                new XC_MethodHook() {
+
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+
+                        ClassLoader cl = ((Context) param.args[0]).getClassLoader();
+
+                        hookClassLoader(lpparam, cl);
+                        hookDexLoader(lpparam);
+                        hookNetwork(lpparam, cl);
+
+                        Log.i(TAG, "SDKHook initialized safely");
+                    }
+                }
+        );
     }
 
-    // 监测 ClassLoader → Java SDK 识别
-    private static void hookClassLoader(final XC_LoadPackage.LoadPackageParam lpparam) {
+    // hook App ClassLoader
+    private static void hookClassLoader(final XC_LoadPackage.LoadPackageParam lpparam, ClassLoader cl) {
+
         XposedHelpers.findAndHookMethod(
-                ClassLoader.class,
+                cl.getClass(),
                 "loadClass",
                 String.class,
                 new XC_MethodHook() {
 
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        String className = (String) param.args[0];
-                        if (className == null) return;
 
-                        String sdk = matchSDK(className);
-                        if (sdk != null) {
-                            report(lpparam.packageName, SDK_CLASS,
-                                    sdk + " -> " + className);
+                        if (Boolean.TRUE.equals(GUARD.get())) return;
+                        GUARD.set(true);
+
+                        try {
+                            String className = (String) param.args[0];
+                            if (className == null) return;
+
+                            // 强过滤（关键）
+                            if (className.startsWith("java.") ||
+                                    className.startsWith("android.") ||
+                                    className.startsWith("kotlin.") ||
+                                    className.startsWith("sun.") ||
+                                    className.startsWith("dalvik.") ||
+                                    className.startsWith("androidx.")) {
+                                return;
+                            }
+
+                            if (!SEEN_CLASSES.add(className)) return;
+
+                            String sdk = matchSDK(className);
+                            if (sdk != null) {
+                                report(lpparam.packageName, SDK_CLASS,
+                                        sdk + " -> " + className);
+                            }
+
+                        } catch (Throwable ignored) {
+                        } finally {
+                            GUARD.set(false);
                         }
                     }
                 }
         );
     }
 
-    // 监测动态 Dex 加载（插件/热更新）
+    // 动态 Dex 加载
     private static void hookDexLoader(final XC_LoadPackage.LoadPackageParam lpparam) {
+
         XposedHelpers.findAndHookConstructor(
                 DexClassLoader.class,
                 String.class, String.class, String.class, ClassLoader.class,
                 new XC_MethodHook() {
+
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        String dexPath = (String) param.args[0];
-                        report(lpparam.packageName, SDK_DEX,
-                                "Dynamic Dex Loaded: " + dexPath);
+                        try {
+                            String dexPath = (String) param.args[0];
+                            report(lpparam.packageName, SDK_DEX,
+                                    "Dynamic Dex Loaded: " + dexPath);
+                        } catch (Throwable ignored) {}
                     }
                 }
         );
     }
 
-    // 监测 Native SO 加载
-    private static void hookSoLoad(final XC_LoadPackage.LoadPackageParam lpparam) {
 
-        // System.loadLibrary
-        XposedHelpers.findAndHookMethod(
-                System.class,
-                "loadLibrary",
-                String.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        String lib = (String) param.args[0];
-                        report(lpparam.packageName, SDK_SO,
-                                "loadLibrary: " + lib);
-                    }
-                }
-        );
-
-        // System.load
-        XposedHelpers.findAndHookMethod(
-                System.class,
-                "load",
-                String.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        String path = (String) param.args[0];
-                        report(lpparam.packageName, SDK_SO,
-                                "load SO Path: " + path);
-                    }
-                }
-        );
-    }
-
-    // 域名识别SDK
-    private static void hookNetwork(final XC_LoadPackage.LoadPackageParam lpparam) {
+    // 网络识别
+    private static void hookNetwork(final XC_LoadPackage.LoadPackageParam lpparam, ClassLoader cl) {
 
         try {
-            Class<?> requestClass = XposedHelpers.findClass(
-                    "okhttp3.Request",
-                    lpparam.classLoader
-            );
+            Class<?> requestClass = cl.loadClass("okhttp3.Request");
 
             XposedHelpers.findAndHookMethod(
                     requestClass,
@@ -129,25 +142,28 @@ public class SDKHook {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            Object urlObj = param.getResult();
-                            if (urlObj == null) return;
+                            try {
+                                Object urlObj = param.getResult();
+                                if (urlObj == null) return;
 
-                            String url = urlObj.toString();
-                            String sdk = matchSDKByHost(url);
+                                String url = urlObj.toString();
+                                String sdk = matchSDKByHost(url);
 
-                            if (sdk != null) {
-                                report(lpparam.packageName, SDK_NETWORK,
-                                        sdk + " -> " + url);
-                            }
+                                if (sdk != null) {
+                                    report(lpparam.packageName, SDK_NETWORK,
+                                            sdk + " -> " + url);
+                                }
+                            } catch (Throwable ignored) {}
                         }
                     }
             );
 
         } catch (Throwable ignored) {
+            // 不存在OkHttp时不会崩
         }
     }
 
-    // SDK 快速匹配逻辑
+    // 匹配逻辑
     private static String matchSDK(String className) {
         for (String prefix : SDK_RULES.keySet()) {
             if (className.startsWith(prefix)) {
@@ -165,7 +181,6 @@ public class SDKHook {
         return null;
     }
 
-    // 数据上报
     private static void report(String pkg, String type, String msg) {
         Log.i(TAG, "[" + type + "] " + msg);
         Report.reportEvent(pkg, type, msg);
