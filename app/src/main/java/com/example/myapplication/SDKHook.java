@@ -36,31 +36,40 @@ public class SDKHook {
         SDK_RULES.put("okhttp3.", "OkHttp");
     }
 
-    public static void init(final XC_LoadPackage.LoadPackageParam lpparam) {
+    //后注入
+//    public static void init(final XC_LoadPackage.LoadPackageParam lpparam) {
+//
+//        // 只 hook 目标 App
+//        if (!lpparam.packageName.equals("com.app99.driver")) return;
+//
+//        // 延迟到 Application.attach
+//        XposedHelpers.findAndHookMethod(
+//                Application.class,
+//                "attach",
+//                Context.class,
+//                new XC_MethodHook() {
+//
+//                    @Override
+//                    protected void afterHookedMethod(MethodHookParam param) {
+//
+//                        ClassLoader cl = ((Context) param.args[0]).getClassLoader();
+//
+//                        hookClassLoader(lpparam, cl);
+//                        hookDexLoader(lpparam);
+//                        hookNetwork(lpparam, cl);
+//
+//                        Log.i(TAG, "SDKHook initialized safely");
+//                    }
+//                }
+//        );
+//    }
 
-        // 只 hook 目标 App
+    //先注入
+    public static void init(XC_LoadPackage.LoadPackageParam lpparam) {
+
         if (!lpparam.packageName.equals("com.app99.driver")) return;
 
-        // 延迟到 Application.attach
-        XposedHelpers.findAndHookMethod(
-                Application.class,
-                "attach",
-                Context.class,
-                new XC_MethodHook() {
-
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-
-                        ClassLoader cl = ((Context) param.args[0]).getClassLoader();
-
-                        hookClassLoader(lpparam, cl);
-                        hookDexLoader(lpparam);
-                        hookNetwork(lpparam, cl);
-
-                        Log.i(TAG, "SDKHook initialized safely");
-                    }
-                }
-        );
+        hookClassLoader(lpparam, lpparam.classLoader);
     }
 
     // hook App ClassLoader
