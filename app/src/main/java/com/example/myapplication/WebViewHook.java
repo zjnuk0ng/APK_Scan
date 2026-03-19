@@ -119,6 +119,6 @@ public class WebViewHook {
 
     private static void report(String pkg, String type, String msg) {
         Log.i(TAG, "[" + type + "] " + msg);
-        SecurityUtils.reportEvent(pkg, type, msg);
+        Report.reportEvent(pkg, type, msg);
     }
 }

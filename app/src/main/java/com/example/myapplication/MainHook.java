@@ -24,10 +24,12 @@ public class MainHook implements IXposedHookLoadPackage {
 
         Log.i(TAG, "Hooking package: " + lpparam.packageName);
 
-        // 1. 初始化 WebView 监控
+        // 初始化 WebView 监控
         WebViewHook.init(lpparam);
+        // 初始化 SDK 识别
+        SDKHook.init(lpparam);
 
-        // 2. 采集目标 App 基线信息
+        // 采集目标 App 基线信息
         hookApplicationForBaseline(lpparam);
     }
 
@@ -40,7 +42,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (context != null) {
                         // 使用工具类采集并上报
                         String data = SecurityUtils.collectBaseline(context);
-                        SecurityUtils.reportToBackend(data);
+                        Report.reportToBackend(data);
                         Log.i(TAG, "Baseline info reported for: " + context.getPackageName());
                     }
                 }
